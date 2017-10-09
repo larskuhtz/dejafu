@@ -14,13 +14,14 @@
 -- 'MonadConc' implementations. This module is NOT considered to form
 module Test.DejaFu.Conc.Internal.Common where
 
-import           Control.Exception  (Exception, MaskingState(..))
-import           Data.Map.Strict    (Map)
+import qualified Control.Concurrent.Classy as C
+import           Control.Exception         (Exception, MaskingState(..))
+import           Data.Map.Strict           (Map)
 import           Test.DejaFu.Common
-import           Test.DejaFu.STM    (STMLike)
+import           Test.DejaFu.STM           (STM)
 
 #if MIN_VERSION_base(4,9,0)
-import qualified Control.Monad.Fail as Fail
+import qualified Control.Monad.Fail        as Fail
 #endif
 
 --------------------------------------------------------------------------------
@@ -34,26 +35,25 @@ import qualified Control.Monad.Fail as Fail
 -- current expression of threads and exception handlers very difficult
 -- (perhaps even not possible without significant reworking), so I
 -- abandoned the attempt.
-newtype M n r a = M { runM :: (a -> Action n r) -> Action n r }
+newtype M m a = M { runM :: (a -> Action m) -> Action m }
 
-instance Functor (M n r) where
+instance Functor (M m) where
     fmap f m = M $ \ c -> runM m (c . f)
 
-instance Applicative (M n r) where
+instance Applicative (M m) where
     -- without the @AReturn@, a thread could lock up testing by
     -- entering an infinite loop (eg: @forever (return ())@)
     pure x  = M $ \c -> AReturn $ c x
     f <*> v = M $ \c -> runM f (\g -> runM v (c . g))
 
-instance Monad (M n r) where
+instance Monad (M m) where
     return  = pure
     m >>= k = M $ \c -> runM m (\x -> runM (k x) c)
 
 #if MIN_VERSION_base(4,9,0)
     fail = Fail.fail
 
--- | @since 0.7.1.2
-instance Fail.MonadFail (M n r) where
+instance Fail.MonadFail (M m) where
 #endif
     fail e = cont (\_ -> AThrow (MonadFailException e))
 
@@ -63,9 +63,9 @@ instance Fail.MonadFail (M n r) where
 -- wakes up all threads blocked on reading it, and it is up to the
 -- scheduler which one runs next. Taking from a @MVar@ behaves
 -- analogously.
-data MVar r a = MVar
+data MVar m a = MVar
   { _cvarId   :: MVarId
-  , _cvarVal  :: r (Maybe a)
+  , _cvarVal  :: C.CRef m (Maybe a)
   }
 
 -- | The mutable non-blocking reference type. These are like 'IORef's.
@@ -75,9 +75,9 @@ data MVar r a = MVar
 -- (so each thread sees its latest write), (b) a commit count (used in
 -- compare-and-swaps), and (c) the current value visible to all
 -- threads.
-data CRef r a = CRef
+data CRef m a = CRef
   { _crefId   :: CRefId
-  , _crefVal  :: r (Map ThreadId a, Integer, a)
+  , _crefVal  :: C.CRef m (Map ThreadId a, Integer, a)
   }
 
 -- | The compare-and-swap proof type.
@@ -94,11 +94,11 @@ data Ticket a = Ticket
   }
 
 -- | Construct a continuation-passing operation from a function.
-cont :: ((a -> Action n r) -> Action n r) -> M n r a
+cont :: ((a -> Action m) -> Action m) -> M m a
 cont = M
 
 -- | Run a CPS computation with the given final computation.
-runCont :: M n r a -> (a -> Action n r) -> Action n r
+runCont :: M m a -> (a -> Action m) -> Action m
 runCont = runM
 
 --------------------------------------------------------------------------------
@@ -108,52 +108,52 @@ runCont = runM
 -- only occur as a result of an action, and they cover (most of) the
 -- primitives of the concurrency. 'spawn' is absent as it is
 -- implemented in terms of 'newEmptyMVar', 'fork', and 'putMVar'.
-data Action n r =
-    AFork  String ((forall b. M n r b -> M n r b) -> Action n r) (ThreadId -> Action n r)
-  | AMyTId (ThreadId -> Action n r)
+data Action m =
+    AFork  String ((forall b. M m b -> M m b) -> Action m) (ThreadId -> Action m)
+  | AMyTId (ThreadId -> Action m)
 
-  | AGetNumCapabilities (Int -> Action n r)
-  | ASetNumCapabilities Int (Action n r)
+  | AGetNumCapabilities (Int -> Action m)
+  | ASetNumCapabilities Int (Action m)
 
-  | forall a. ANewMVar String (MVar r a -> Action n r)
-  | forall a. APutMVar     (MVar r a) a (Action n r)
-  | forall a. ATryPutMVar  (MVar r a) a (Bool -> Action n r)
-  | forall a. AReadMVar    (MVar r a) (a -> Action n r)
-  | forall a. ATryReadMVar (MVar r a) (Maybe a -> Action n r)
-  | forall a. ATakeMVar    (MVar r a) (a -> Action n r)
-  | forall a. ATryTakeMVar (MVar r a) (Maybe a -> Action n r)
+  | forall a. ANewMVar String (MVar m a -> Action m)
+  | forall a. APutMVar     (MVar m a) a (Action m)
+  | forall a. ATryPutMVar  (MVar m a) a (Bool -> Action m)
+  | forall a. AReadMVar    (MVar m a) (a -> Action m)
+  | forall a. ATryReadMVar (MVar m a) (Maybe a -> Action m)
+  | forall a. ATakeMVar    (MVar m a) (a -> Action m)
+  | forall a. ATryTakeMVar (MVar m a) (Maybe a -> Action m)
 
-  | forall a.   ANewCRef String a (CRef r a -> Action n r)
-  | forall a.   AReadCRef    (CRef r a) (a -> Action n r)
-  | forall a.   AReadCRefCas (CRef r a) (Ticket a -> Action n r)
-  | forall a b. AModCRef     (CRef r a) (a -> (a, b)) (b -> Action n r)
-  | forall a b. AModCRefCas  (CRef r a) (a -> (a, b)) (b -> Action n r)
-  | forall a.   AWriteCRef   (CRef r a) a (Action n r)
-  | forall a.   ACasCRef     (CRef r a) (Ticket a) a ((Bool, Ticket a) -> Action n r)
+  | forall a.   ANewCRef String a (CRef m a -> Action m)
+  | forall a.   AReadCRef    (CRef m a) (a -> Action m)
+  | forall a.   AReadCRefCas (CRef m a) (Ticket a -> Action m)
+  | forall a b. AModCRef     (CRef m a) (a -> (a, b)) (b -> Action m)
+  | forall a b. AModCRefCas  (CRef m a) (a -> (a, b)) (b -> Action m)
+  | forall a.   AWriteCRef   (CRef m a) a (Action m)
+  | forall a.   ACasCRef     (CRef m a) (Ticket a) a ((Bool, Ticket a) -> Action m)
 
   | forall e.   Exception e => AThrow e
-  | forall e.   Exception e => AThrowTo ThreadId e (Action n r)
-  | forall a e. Exception e => ACatching (e -> M n r a) (M n r a) (a -> Action n r)
-  | APopCatching (Action n r)
-  | forall a. AMasking MaskingState ((forall b. M n r b -> M n r b) -> M n r a) (a -> Action n r)
-  | AResetMask Bool Bool MaskingState (Action n r)
+  | forall e.   Exception e => AThrowTo ThreadId e (Action m)
+  | forall a e. Exception e => ACatching (e -> M m a) (M m a) (a -> Action m)
+  | APopCatching (Action m)
+  | forall a. AMasking MaskingState ((forall b. M m b -> M m b) -> M m a) (a -> Action m)
+  | AResetMask Bool Bool MaskingState (Action m)
 
-  | forall a. AAtom (STMLike n r a) (a -> Action n r)
-  | ALift (n (Action n r))
-  | AYield  (Action n r)
-  | ADelay Int (Action n r)
-  | AReturn (Action n r)
+  | forall a. AAtom (STM m a) (a -> Action m)
+  | ALift (m (Action m))
+  | AYield  (Action m)
+  | ADelay Int (Action m)
+  | AReturn (Action m)
   | ACommit ThreadId CRefId
-  | AStop (n ())
+  | AStop (m ())
 
-  | forall a. ASub (M n r a) (Either Failure a -> Action n r)
-  | AStopSub (Action n r)
+  | forall a. ASub (M m a) (Either Failure a -> Action m)
+  | AStopSub (Action m)
 
 --------------------------------------------------------------------------------
 -- * Scheduling & Traces
 
 -- | Look as far ahead in the given continuation as possible.
-lookahead :: Action n r -> Lookahead
+lookahead :: Action m -> Lookahead
 lookahead (AFork _ _ _) = WillFork
 lookahead (AMyTId _) = WillMyThreadId
 lookahead (AGetNumCapabilities _) = WillGetNumCapabilities

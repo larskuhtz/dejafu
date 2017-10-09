@@ -113,7 +113,7 @@ import           Data.Set                 (Set)
 import qualified Data.Set                 as S
 import           Test.LeanCheck           (Listable(..), concatMapT, mapT)
 
-import           Test.DejaFu.Conc         (ConcIO, Failure, subconcurrency)
+import           Test.DejaFu.Conc         (DejaFu, Failure, subconcurrency)
 import           Test.DejaFu.Defaults     (defaultMemType, defaultWay)
 import           Test.DejaFu.SCT          (runSCT)
 
@@ -133,20 +133,20 @@ data RefinementProperty o x where
 -- | A concurrent function and some information about how to execute
 -- it and observe its effect.
 --
--- * @s@ is the state type (@MVar ConcIO a@ in the example)
+-- * @s@ is the state type (@MVar (DejaFu IO) a@ in the example)
 -- * @o@ is the observation type (@Maybe a@ in the example)
 -- * @x@ is the seed type (@Maybe a@ in the example)
 --
--- @since 0.7.0.0
+-- @since unreleased
 data Sig s o x = Sig
-  { initialise :: x -> ConcIO s
+  { initialise :: x -> DejaFu IO s
   -- ^ Create a new instance of the state variable.
-  , observe :: s -> x -> ConcIO o
+  , observe :: s -> x -> DejaFu IO o
   -- ^ The observation to make.
-  , interfere :: s -> x -> ConcIO ()
+  , interfere :: s -> x -> DejaFu IO ()
   -- ^ Set the state value. This doesn't need to be atomic, or even
   -- guaranteed to work, its purpose is to cause interference.
-  , expression :: s -> ConcIO ()
+  , expression :: s -> DejaFu IO ()
   -- ^ The expression to evaluate.
   }
 

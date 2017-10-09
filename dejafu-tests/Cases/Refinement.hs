@@ -2,7 +2,7 @@ module Cases.Refinement where
 
 import Control.Concurrent.Classy.MVar
 import Control.Monad (void)
-import Test.DejaFu.Conc (ConcIO)
+import Test.DejaFu.Conc (DejaFu)
 import Test.DejaFu.Refinement
 import Test.HUnit.DejaFu (testProperty)
 
@@ -13,7 +13,7 @@ tests = [ testGroup "MVar" mvarProps ]
 
 -------------------------------------------------------------------------------
 
-mvar :: (MVar ConcIO Int -> ConcIO a) ->  Sig (MVar ConcIO Int) (Maybe Int) (Maybe Int)
+mvar :: (MVar (DejaFu IO) Int -> DejaFu IO a) -> Sig (MVar (DejaFu IO) Int) (Maybe Int) (Maybe Int)
 mvar e = Sig
   { initialise = maybe newEmptyMVar newMVar
   , observe    = const . tryTakeMVar

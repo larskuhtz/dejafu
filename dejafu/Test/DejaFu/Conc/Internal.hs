@@ -1,24 +1,19 @@
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 -- |
 -- Module      : Test.DejaFu.Conc.Internal
 -- Copyright   : (c) 2016 Michael Walker
 -- License     : MIT
 -- Maintainer  : Michael Walker <mike@barrucadu.co.uk>
 -- Stability   : experimental
--- Portability : MultiParamTypeClasses, RankNTypes, ScopedTypeVariables
+-- Portability : portable
 --
 -- Concurrent monads with a fixed scheduler: internal types and
 -- functions. This module is NOT considered to form part of the public
 -- interface of this library.
 module Test.DejaFu.Conc.Internal where
 
+import qualified Control.Concurrent.Classy           as C
 import           Control.Exception                   (MaskingState(..),
                                                       toException)
-import           Control.Monad.Ref                   (MonadRef, newRef, readRef,
-                                                      writeRef)
 import           Data.Functor                        (void)
 import           Data.List                           (sortOn)
 import           Data.List.NonEmpty                  (fromList)
@@ -46,14 +41,14 @@ type SeqTrace
 -- | Run a concurrent computation with a given 'Scheduler' and initial
 -- state, returning a failure reason on error. Also returned is the
 -- final state of the scheduler, and an execution trace.
-runConcurrency :: MonadRef r n
-               => Scheduler g
-               -> MemType
-               -> g
-               -> IdSource
-               -> Int
-               -> M n r a
-               -> n (Either Failure a, Context n r g, SeqTrace, Maybe (ThreadId, ThreadAction))
+runConcurrency :: C.MonadConc m
+  => Scheduler g
+  -> MemType
+  -> g
+  -> IdSource
+  -> Int
+  -> M m a
+  -> m (Either Failure a, Context m g, SeqTrace, Maybe (ThreadId, ThreadAction))
 runConcurrency sched memtype g idsrc caps ma = do
   (c, ref) <- runRefCont AStop (Just . Right) (runM ma)
   let ctx = Context { cSchedState = g
@@ -63,25 +58,25 @@ runConcurrency sched memtype g idsrc caps ma = do
                     , cCaps       = caps
                     }
   (finalCtx, trace, finalAction) <- runThreads sched memtype ref ctx
-  out <- readRef ref
+  out <- C.readCRef ref
   pure (fromJust out, finalCtx, trace, finalAction)
 
 -- | The context a collection of threads are running in.
-data Context n r g = Context
+data Context m g = Context
   { cSchedState :: g
   , cIdSource   :: IdSource
-  , cThreads    :: Threads n r
-  , cWriteBuf   :: WriteBuffer r
+  , cThreads    :: Threads m
+  , cWriteBuf   :: WriteBuffer m
   , cCaps       :: Int
   }
 
 -- | Run a collection of threads, until there are no threads left.
-runThreads :: MonadRef r n
+runThreads :: C.MonadConc m
   => Scheduler g
   -> MemType
-  -> r (Maybe (Either Failure a))
-  -> Context n r g
-  -> n (Context n r g, SeqTrace, Maybe (ThreadId, ThreadAction))
+  -> C.CRef m (Maybe (Either Failure a))
+  -> Context m g
+  -> m (Context m g, SeqTrace, Maybe (ThreadId, ThreadAction))
 runThreads sched memtype ref = go Seq.empty Nothing where
   go sofar prior ctx
     | isTerminated  = pure (ctx, sofar, prior)
@@ -117,7 +112,7 @@ runThreads sched memtype ref = go Seq.empty Nothing where
           _ -> thrd
 
       die sofar' finalDecision reason finalCtx = do
-        writeRef ref (Just $ Left reason)
+        C.atomicWriteCRef ref (Just $ Left reason)
         pure (finalCtx, sofar', finalDecision)
 
       step chosen thread ctx' = do
@@ -160,18 +155,18 @@ data Act
 
 -- | Run a single thread one step, by dispatching on the type of
 -- 'Action'.
-stepThread :: forall n r g. MonadRef r n
+stepThread :: C.MonadConc m
   => Scheduler g
   -- ^ The scheduler.
   -> MemType
   -- ^ The memory model to use.
   -> ThreadId
   -- ^ ID of the current thread
-  -> Action n r
+  -> Action m
   -- ^ Action to step
-  -> Context n r g
+  -> Context m g
   -- ^ The execution context.
-  -> n (Either Failure (Context n r g), Act)
+  -> m (Either Failure (Context m g), Act)
 stepThread sched memtype tid action ctx = case action of
     -- start a new thread, assigning it the next 'ThreadId'
     AFork n a b -> pure $
@@ -198,7 +193,7 @@ stepThread sched memtype tid action ctx = case action of
     -- create a new @MVar@, using the next 'MVarId'.
     ANewMVar n c -> do
       let (idSource', newmvid) = nextMVId n (cIdSource ctx)
-      ref <- newRef Nothing
+      ref <- C.newCRef Nothing
       let mvar = MVar newmvid ref
       pure (Right ctx { cThreads = goto (c mvar) tid (cThreads ctx), cIdSource = idSource' }, Single (NewMVar newmvid))
 
@@ -238,7 +233,7 @@ stepThread sched memtype tid action ctx = case action of
     -- create a new @CRef@, using the next 'CRefId'.
     ANewCRef n a c -> do
       let (idSource', newcrid) = nextCRId n (cIdSource ctx)
-      ref <- newRef (M.empty, 0, a)
+      ref <- C.newCRef (M.empty, 0, a)
       let cref = CRef newcrid ref
       pure (Right ctx { cThreads = goto (c cref) tid (cThreads ctx), cIdSource = idSource' }, Single (NewCRef newcrid))
 

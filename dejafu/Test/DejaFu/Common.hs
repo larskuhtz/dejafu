@@ -68,15 +68,15 @@ module Test.DejaFu.Common
   , runRefCont
   ) where
 
-import           Control.DeepSeq   (NFData(..))
-import           Control.Exception (Exception(..), MaskingState(..),
-                                    SomeException, displayException)
-import           Control.Monad.Ref (MonadRef(..))
-import           Data.Function     (on)
-import           Data.List         (intercalate)
-import           Data.Maybe        (fromMaybe, mapMaybe)
-import           Data.Set          (Set)
-import qualified Data.Set          as S
+import qualified Control.Concurrent.Classy as C
+import           Control.DeepSeq           (NFData(..))
+import           Control.Exception         (Exception(..), MaskingState(..),
+                                            SomeException, displayException)
+import           Data.Function             (on)
+import           Data.List                 (intercalate)
+import           Data.Maybe                (fromMaybe, mapMaybe)
+import           Data.Set                  (Set)
+import qualified Data.Set                  as S
 
 -------------------------------------------------------------------------------
 -- Identifiers
@@ -977,10 +977,12 @@ instance Exception MonadFailException
 -- | Run with a continuation that writes its value into a reference,
 -- returning the computation and the reference.  Using the reference
 -- is non-blocking, it is up to you to ensure you wait sufficiently.
-runRefCont :: MonadRef r n => (n () -> x) -> (a -> Maybe b) -> ((a -> x) -> x) -> n (x, r (Maybe b))
+--
+-- @since unreleased
+runRefCont :: C.MonadConc m => (m () -> x) -> (a -> Maybe b) -> ((a -> x) -> x) -> m (x, C.CRef m (Maybe b))
 runRefCont act f k = do
-  ref <- newRef Nothing
-  let c = k (act . writeRef ref . f)
+  ref <- C.newCRef Nothing
+  let c = k (act . C.atomicWriteCRef ref . f)
   pure (c, ref)
 
 -------------------------------------------------------------------------------

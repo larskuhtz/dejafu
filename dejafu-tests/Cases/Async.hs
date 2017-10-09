@@ -15,7 +15,7 @@ import Data.List (sort)
 import Data.Maybe (isJust, isNothing)
 import Data.Typeable (Typeable)
 import Test.DejaFu (alwaysTrue)
-import Test.DejaFu.Conc (ConcST)
+import Test.DejaFu.Conc (DejaFu)
 
 import Common
 
@@ -180,7 +180,7 @@ assertEqual err a1 a2
   | a1 == a2  = pure ()
   | otherwise = assertFailure err
 
-testCase :: String -> (forall t. ConcST t ()) -> Test
+testCase :: String -> DejaFu IO () -> Test
 testCase name c = djfu name (alwaysTrue p) (try c) where
   p (Right (Left (e::SomeException))) = False
   p (Right _) = True

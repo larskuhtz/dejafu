@@ -1,6 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 
 -- |
 -- Module      : Test.DejaFu.Conc.Internal.Memory
@@ -8,7 +7,7 @@
 -- License     : MIT
 -- Maintainer  : Michael Walker <mike@barrucadu.co.uk>
 -- Stability   : experimental
--- Portability : BangPatterns, GADTs, MultiParamTypeClasses
+-- Portability : BangPatterns, GADTs
 --
 -- Operations over @CRef@s and @MVar@s. This module is NOT considered
 -- to form part of the public interface of this library.
@@ -23,8 +22,7 @@
 -- Memory Models/, N. Zhang, M. Kusano, and C. Wang (2015).
 module Test.DejaFu.Conc.Internal.Memory where
 
-import           Control.Monad.Ref                   (MonadRef, readRef,
-                                                      writeRef)
+import qualified Control.Concurrent.Classy           as C
 import           Data.Map.Strict                     (Map)
 import           Data.Maybe                          (fromJust, maybeToList)
 import           Data.Monoid                         ((<>))
@@ -45,58 +43,57 @@ import qualified Data.Map.Strict                     as M
 --
 -- The @CRefId@ parameter is only used under PSO. Under TSO each
 -- thread has a single buffer.
-newtype WriteBuffer r = WriteBuffer
-  { buffer :: Map (ThreadId, Maybe CRefId) (Seq (BufferedWrite r)) }
+newtype WriteBuffer m = WriteBuffer
+  { buffer :: Map (ThreadId, Maybe CRefId) (Seq (BufferedWrite m)) }
 
 -- | A buffered write is a reference to the variable, and the value to
 -- write. Universally quantified over the value type so that the only
 -- thing which can be done with it is to write it to the reference.
-data BufferedWrite r where
-  BufferedWrite :: ThreadId -> CRef r a -> a -> BufferedWrite r
+data BufferedWrite m where
+  BufferedWrite :: ThreadId -> CRef m a -> a -> BufferedWrite m
 
 -- | An empty write buffer.
-emptyBuffer :: WriteBuffer r
+emptyBuffer :: WriteBuffer m
 emptyBuffer = WriteBuffer M.empty
 
 -- | Add a new write to the end of a buffer.
-bufferWrite :: MonadRef r n => WriteBuffer r -> (ThreadId, Maybe CRefId) -> CRef r a -> a -> n (WriteBuffer r)
+bufferWrite :: C.MonadConc m => WriteBuffer m -> (ThreadId, Maybe CRefId) -> CRef m a -> a -> m (WriteBuffer m)
 bufferWrite (WriteBuffer wb) k@(tid, _) cref@(CRef _ ref) new = do
   -- Construct the new write buffer
   let write = singleton $ BufferedWrite tid cref new
   let buffer' = M.insertWith (flip (><)) k write wb
 
   -- Write the thread-local value to the @CRef@'s update map.
-  (locals, count, def) <- readRef ref
-  writeRef ref (M.insert tid new locals, count, def)
+  (locals, count, def) <- C.readCRef ref
+  C.atomicWriteCRef ref (M.insert tid new locals, count, def)
 
   pure (WriteBuffer buffer')
 
 -- | Commit the write at the head of a buffer.
-commitWrite :: MonadRef r n => WriteBuffer r -> (ThreadId, Maybe CRefId) -> n (WriteBuffer r)
+commitWrite :: C.MonadConc m => WriteBuffer m -> (ThreadId, Maybe CRefId) -> m (WriteBuffer m)
 commitWrite w@(WriteBuffer wb) k = case maybe EmptyL viewl $ M.lookup k wb of
   BufferedWrite _ cref a :< rest -> do
     writeImmediate cref a
     pure . WriteBuffer $ M.insert k rest wb
-
   EmptyL -> pure w
 
 -- | Read from a @CRef@, returning a newer thread-local non-committed
 -- write if there is one.
-readCRef :: MonadRef r n => CRef r a -> ThreadId -> n a
+readCRef :: C.MonadConc m => CRef m a -> ThreadId -> m a
 readCRef cref tid = do
   (val, _) <- readCRefPrim cref tid
   pure val
 
 -- | Read from a @CRef@, returning a @Ticket@ representing the current
 -- view of the thread.
-readForTicket :: MonadRef r n => CRef r a -> ThreadId -> n (Ticket a)
+readForTicket :: C.MonadConc m => CRef m a -> ThreadId -> m (Ticket a)
 readForTicket cref@(CRef crid _) tid = do
   (val, count) <- readCRefPrim cref tid
   pure (Ticket crid count val)
 
 -- | Perform a compare-and-swap on a @CRef@ if the ticket is still
 -- valid. This is strict in the \"new\" value argument.
-casCRef :: MonadRef r n => CRef r a -> ThreadId -> Ticket a -> a -> n (Bool, Ticket a)
+casCRef :: C.MonadConc m => CRef m a -> ThreadId -> Ticket a -> a -> m (Bool, Ticket a)
 casCRef cref tid (Ticket _ cc _) !new = do
   tick'@(Ticket _ cc' _) <- readForTicket cref tid
 
@@ -108,26 +105,25 @@ casCRef cref tid (Ticket _ cc _) !new = do
   else pure (False, tick')
 
 -- | Read the local state of a @CRef@.
-readCRefPrim :: MonadRef r n => CRef r a -> ThreadId -> n (a, Integer)
+readCRefPrim :: C.MonadConc m => CRef m a -> ThreadId -> m (a, Integer)
 readCRefPrim (CRef _ ref) tid = do
-  (vals, count, def) <- readRef ref
-
+  (vals, count, def) <- C.readCRef ref
   pure (M.findWithDefault def tid vals, count)
 
 -- | Write and commit to a @CRef@ immediately, clearing the update map
 -- and incrementing the write count.
-writeImmediate :: MonadRef r n => CRef r a -> a -> n ()
+writeImmediate :: C.MonadConc m => CRef m a -> a -> m ()
 writeImmediate (CRef _ ref) a = do
-  (_, count, _) <- readRef ref
-  writeRef ref (M.empty, count + 1, a)
+  (_, count, _) <- C.readCRef ref
+  C.atomicWriteCRef ref (M.empty, count + 1, a)
 
 -- | Flush all writes in the buffer.
-writeBarrier :: MonadRef r n => WriteBuffer r -> n ()
+writeBarrier :: C.MonadConc m => WriteBuffer m -> m ()
 writeBarrier (WriteBuffer wb) = mapM_ flush $ M.elems wb where
   flush = mapM_ $ \(BufferedWrite _ cref a) -> writeImmediate cref a
 
 -- | Add phantom threads to the thread list to commit pending writes.
-addCommitThreads :: WriteBuffer r -> Threads n r -> Threads n r
+addCommitThreads :: WriteBuffer m -> Threads m -> Threads m
 addCommitThreads (WriteBuffer wb) ts = ts <> M.fromList phantoms where
   phantoms = [ (ThreadId Nothing $ negate tid, mkthread c)
              | ((_, b), tid) <- zip (M.toList wb) [1..]
@@ -137,7 +133,7 @@ addCommitThreads (WriteBuffer wb) ts = ts <> M.fromList phantoms where
   go EmptyL = Nothing
 
 -- | Remove phantom threads.
-delCommitThreads :: Threads n r -> Threads n r
+delCommitThreads :: Threads m -> Threads m
 delCommitThreads = M.filterWithKey $ \k _ -> k >= initialThread
 
 --------------------------------------------------------------------------------
@@ -148,41 +144,47 @@ data Blocking = Blocking | NonBlocking
 data Emptying = Emptying | NonEmptying
 
 -- | Put into a @MVar@, blocking if full.
-putIntoMVar :: MonadRef r n => MVar r a -> a -> Action n r
-            -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+putIntoMVar :: C.MonadConc m
+  => MVar m a -> a -> Action m -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 putIntoMVar cvar a c = mutMVar Blocking cvar a (const c)
 
 -- | Try to put into a @MVar@, not blocking if full.
-tryPutIntoMVar :: MonadRef r n => MVar r a -> a -> (Bool -> Action n r)
-               -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+tryPutIntoMVar :: C.MonadConc m
+  => MVar m a -> a -> (Bool -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 tryPutIntoMVar = mutMVar NonBlocking
 
 -- | Read from a @MVar@, blocking if empty.
-readFromMVar :: MonadRef r n => MVar r a -> (a -> Action n r)
-            -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+readFromMVar :: C.MonadConc m
+  => MVar m a -> (a -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 readFromMVar cvar c = seeMVar NonEmptying Blocking cvar (c . fromJust)
 
 -- | Try to read from a @MVar@, not blocking if empty.
-tryReadFromMVar :: MonadRef r n => MVar r a -> (Maybe a -> Action n r)
-                -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+tryReadFromMVar :: C.MonadConc m
+  => MVar m a -> (Maybe a -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 tryReadFromMVar = seeMVar NonEmptying NonBlocking
 
 -- | Take from a @MVar@, blocking if empty.
-takeFromMVar :: MonadRef r n => MVar r a -> (a -> Action n r)
-             -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+takeFromMVar :: C.MonadConc m
+  => MVar m a -> (a -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 takeFromMVar cvar c = seeMVar Emptying Blocking cvar (c . fromJust)
 
 -- | Try to take from a @MVar@, not blocking if empty.
-tryTakeFromMVar :: MonadRef r n => MVar r a -> (Maybe a -> Action n r)
-                -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+tryTakeFromMVar :: C.MonadConc m
+  => MVar m a -> (Maybe a -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 tryTakeFromMVar = seeMVar Emptying NonBlocking
 
 -- | Mutate a @MVar@, in either a blocking or nonblocking way.
-mutMVar :: MonadRef r n
-        => Blocking -> MVar r a -> a -> (Bool -> Action n r)
-        -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+mutMVar :: C.MonadConc m
+  => Blocking -> MVar m a -> a -> (Bool -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 mutMVar blocking (MVar cvid ref) a c threadid threads = do
-  val <- readRef ref
+  val <- C.readCRef ref
 
   case val of
     Just _ -> case blocking of
@@ -193,22 +195,22 @@ mutMVar blocking (MVar cvid ref) a c threadid threads = do
         pure (False, goto (c False) threadid threads, [])
 
     Nothing -> do
-      writeRef ref $ Just a
+      C.atomicWriteCRef ref $ Just a
       let (threads', woken) = wake (OnMVarFull cvid) threads
       pure (True, goto (c True) threadid threads', woken)
 
 -- | Read a @MVar@, in either a blocking or nonblocking
 -- way.
-seeMVar :: MonadRef r n
-        => Emptying -> Blocking -> MVar r a -> (Maybe a -> Action n r)
-        -> ThreadId -> Threads n r -> n (Bool, Threads n r, [ThreadId])
+seeMVar :: C.MonadConc m
+  => Emptying -> Blocking -> MVar m a -> (Maybe a -> Action m) -> ThreadId -> Threads m
+  -> m (Bool, Threads m, [ThreadId])
 seeMVar emptying blocking (MVar cvid ref) c threadid threads = do
-  val <- readRef ref
+  val <- C.readCRef ref
 
   case val of
     Just _ -> do
       case emptying of
-        Emptying    -> writeRef ref Nothing
+        Emptying    -> C.atomicWriteCRef ref Nothing
         NonEmptying -> pure ()
       let (threads', woken) = wake (OnMVarEmpty cvid) threads
       pure (True, goto (c val) threadid threads', woken)

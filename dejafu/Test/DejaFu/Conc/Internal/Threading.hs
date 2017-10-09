@@ -28,22 +28,22 @@ import qualified Data.Map.Strict                  as M
 -- * Threads
 
 -- | Threads are stored in a map index by 'ThreadId'.
-type Threads n r = Map ThreadId (Thread n r)
+type Threads m = Map ThreadId (Thread m)
 
 -- | All the state of a thread.
-data Thread n r = Thread
-  { _continuation :: Action n r
+data Thread m = Thread
+  { _continuation :: Action m
   -- ^ The next action to execute.
   , _blocking     :: Maybe BlockedOn
   -- ^ The state of any blocks.
-  , _handlers     :: [Handler n r]
+  , _handlers     :: [Handler m]
   -- ^ Stack of exception handlers
   , _masking      :: MaskingState
   -- ^ The exception masking state.
   }
 
 -- | Construct a thread with just one action
-mkthread :: Action n r -> Thread n r
+mkthread :: Action m -> Thread m
 mkthread c = Thread c Nothing [] Unmasked
 
 --------------------------------------------------------------------------------
@@ -54,7 +54,7 @@ mkthread c = Thread c Nothing [] Unmasked
 data BlockedOn = OnMVarFull MVarId | OnMVarEmpty MVarId | OnTVar [TVarId] | OnMask ThreadId deriving Eq
 
 -- | Determine if a thread is blocked in a certain way.
-(~=) :: Thread n r -> BlockedOn -> Bool
+(~=) :: Thread m -> BlockedOn -> Bool
 thread ~= theblock = case (_blocking thread, theblock) of
   (Just (OnMVarFull  _), OnMVarFull  _) -> True
   (Just (OnMVarEmpty _), OnMVarEmpty _) -> True
@@ -66,11 +66,11 @@ thread ~= theblock = case (_blocking thread, theblock) of
 -- * Exceptions
 
 -- | An exception handler.
-data Handler n r = forall e. Exception e => Handler (e -> MaskingState -> Action n r)
+data Handler m = forall e. Exception e => Handler (e -> MaskingState -> Action m)
 
 -- | Propagate an exception upwards, finding the closest handler
 -- which can deal with it.
-propagate :: SomeException -> ThreadId -> Threads n r -> Maybe (Threads n r)
+propagate :: SomeException -> ThreadId -> Threads m -> Maybe (Threads m)
 propagate e tid threads = case M.lookup tid threads >>= go . _handlers of
   Just (act, hs) -> Just $ except act hs tid threads
   Nothing -> Nothing
@@ -80,22 +80,22 @@ propagate e tid threads = case M.lookup tid threads >>= go . _handlers of
     go (Handler h:hs) = maybe (go hs) (\act -> Just (act, hs)) $ h <$> fromException e
 
 -- | Check if a thread can be interrupted by an exception.
-interruptible :: Thread n r -> Bool
+interruptible :: Thread m -> Bool
 interruptible thread = _masking thread == Unmasked || (_masking thread == MaskedInterruptible && isJust (_blocking thread))
 
 -- | Register a new exception handler.
-catching :: Exception e => (e -> Action n r) -> ThreadId -> Threads n r -> Threads n r
+catching :: Exception e => (e -> Action m) -> ThreadId -> Threads m -> Threads m
 catching h = M.adjust $ \thread ->
   let ms0 = _masking thread
       h'  = Handler $ \e ms -> (if ms /= ms0 then AResetMask False False ms0 else id) (h e)
   in thread { _handlers = h' : _handlers thread }
 
 -- | Remove the most recent exception handler.
-uncatching :: ThreadId -> Threads n r -> Threads n r
+uncatching :: ThreadId -> Threads m -> Threads m
 uncatching = M.adjust $ \thread -> thread { _handlers = tail $ _handlers thread }
 
 -- | Raise an exception in a thread.
-except :: (MaskingState -> Action n r) -> [Handler n r] -> ThreadId -> Threads n r -> Threads n r
+except :: (MaskingState -> Action m) -> [Handler m] -> ThreadId -> Threads m -> Threads m
 except actf hs = M.adjust $ \thread -> thread
   { _continuation = actf (_masking thread)
   , _handlers = hs
@@ -103,24 +103,24 @@ except actf hs = M.adjust $ \thread -> thread
   }
 
 -- | Set the masking state of a thread.
-mask :: MaskingState -> ThreadId -> Threads n r -> Threads n r
+mask :: MaskingState -> ThreadId -> Threads m -> Threads m
 mask ms = M.adjust $ \thread -> thread { _masking = ms }
 
 --------------------------------------------------------------------------------
 -- * Manipulating threads
 
 -- | Replace the @Action@ of a thread.
-goto :: Action n r -> ThreadId -> Threads n r -> Threads n r
+goto :: Action m -> ThreadId -> Threads m -> Threads m
 goto a = M.adjust $ \thread -> thread { _continuation = a }
 
 -- | Start a thread with the given ID, inheriting the masking state
 -- from the parent thread. This ID must not already be in use!
-launch :: ThreadId -> ThreadId -> ((forall b. M n r b -> M n r b) -> Action n r) -> Threads n r -> Threads n r
+launch :: ThreadId -> ThreadId -> ((forall b. M m b -> M m b) -> Action m) -> Threads m -> Threads m
 launch parent tid a threads = launch' ms tid a threads where
   ms = fromMaybe Unmasked $ _masking <$> M.lookup parent threads
 
 -- | Start a thread with the given ID and masking state. This must not already be in use!
-launch' :: MaskingState -> ThreadId -> ((forall b. M n r b -> M n r b) -> Action n r) -> Threads n r -> Threads n r
+launch' :: MaskingState -> ThreadId -> ((forall b. M m b -> M m b) -> Action m) -> Threads m -> Threads m
 launch' ms tid a = M.insert tid thread where
   thread = Thread { _continuation = a umask, _blocking = Nothing, _handlers = [], _masking = ms }
 
@@ -128,17 +128,17 @@ launch' ms tid a = M.insert tid thread where
   resetMask typ m = cont $ \k -> AResetMask typ True m $ k ()
 
 -- | Kill a thread.
-kill :: ThreadId -> Threads n r -> Threads n r
+kill :: ThreadId -> Threads m -> Threads m
 kill = M.delete
 
 -- | Block a thread.
-block :: BlockedOn -> ThreadId -> Threads n r -> Threads n r
+block :: BlockedOn -> ThreadId -> Threads m -> Threads m
 block blockedOn = M.adjust $ \thread -> thread { _blocking = Just blockedOn }
 
 -- | Unblock all threads waiting on the appropriate block. For 'TVar'
 -- blocks, this will wake all threads waiting on at least one of the
 -- given 'TVar's.
-wake :: BlockedOn -> Threads n r -> (Threads n r, [ThreadId])
+wake :: BlockedOn -> Threads m -> (Threads m, [ThreadId])
 wake blockedOn threads = (unblock <$> threads, M.keys $ M.filter isBlocked threads) where
   unblock thread
     | isBlocked thread = thread { _blocking = Nothing }

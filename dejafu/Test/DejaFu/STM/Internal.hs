@@ -1,7 +1,7 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module      : Test.DejaFu.STM.Internal
@@ -9,60 +9,56 @@
 -- License     : MIT
 -- Maintainer  : Michael Walker <mike@barrucadu.co.uk>
 -- Stability   : experimental
--- Portability : CPP, ExistentialQuantification, MultiParamTypeClasses, RankNTypes
+-- Portability : CPP, ExistentialQuantification, RankNTypes, ScopedTypeVariables
 --
 -- 'MonadSTM' testing implementation, internal types and
 -- definitions. This module is NOT considered to form part of the
 -- public interface of this library.
 module Test.DejaFu.STM.Internal where
 
-import           Control.DeepSeq    (NFData(..))
-import           Control.Exception  (Exception, SomeException, fromException,
-                                     toException)
-import           Control.Monad.Ref  (MonadRef, newRef, readRef, writeRef)
-import           Data.List          (nub)
+import           Control.DeepSeq          (NFData(..))
+import           Control.Exception        (Exception, SomeException,
+                                           fromException, toException)
+import qualified Control.Monad.Conc.Class as C
+import           Data.List                (nub)
 
 import           Test.DejaFu.Common
 
 #if MIN_VERSION_base(4,9,0)
-import qualified Control.Monad.Fail as Fail
+import qualified Control.Monad.Fail       as Fail
 #endif
-
---------------------------------------------------------------------------------
--- The @STMLike@ monad
 
 -- | The underlying monad is based on continuations over primitive
 -- actions.
 --
 -- This is not @Cont@ because we want to give it a custom @MonadFail@
 -- instance.
-newtype M n r a = M { runM :: (a -> STMAction n r) -> STMAction n r }
+newtype M m a = M { runM :: (a -> STMAction m) -> STMAction m }
 
-instance Functor (M n r) where
+instance Functor (M m) where
     fmap f m = M $ \ c -> runM m (c . f)
 
-instance Applicative (M n r) where
+instance Applicative (M m) where
     pure x  = M $ \c -> c x
     f <*> v = M $ \c -> runM f (\g -> runM v (c . g))
 
-instance Monad (M n r) where
+instance Monad (M m) where
     return  = pure
     m >>= k = M $ \c -> runM m (\x -> runM (k x) c)
 
 #if MIN_VERSION_base(4,9,0)
     fail = Fail.fail
 
--- | @since 0.7.1.2
-instance Fail.MonadFail (M n r) where
+instance Fail.MonadFail (M m) where
 #endif
     fail e = cont (\_ -> SThrow (MonadFailException e))
 
 -- | Construct a continuation-passing operation from a function.
-cont :: ((a -> STMAction n r) -> STMAction n r) -> M n r a
+cont :: ((a -> STMAction m) -> STMAction m) -> M m a
 cont = M
 
 -- | Run a CPS computation with the given final computation.
-runCont :: M n r a -> (a -> STMAction n r) -> STMAction n r
+runCont :: M m a -> (a -> STMAction m) -> STMAction m
 runCont = runM
 
 --------------------------------------------------------------------------------
@@ -70,15 +66,15 @@ runCont = runM
 
 -- | STM transactions are represented as a sequence of primitive
 -- actions.
-data STMAction n r
-  = forall a e. Exception e => SCatch (e -> M n r a) (M n r a) (a -> STMAction n r)
-  | forall a. SRead  (TVar r a) (a -> STMAction n r)
-  | forall a. SWrite (TVar r a) a (STMAction n r)
-  | forall a. SOrElse (M n r a) (M n r a) (a -> STMAction n r)
-  | forall a. SNew String a (TVar r a -> STMAction n r)
+data STMAction m
+  = forall a e. Exception e => SCatch (e -> M m a) (M m a) (a -> STMAction m)
+  | forall a. SRead  (TVar m a) (a -> STMAction m)
+  | forall a. SWrite (TVar m a) a (STMAction m)
+  | forall a. SOrElse (M m a) (M m a) (a -> STMAction m)
+  | forall a. SNew String a (TVar m a -> STMAction m)
   | forall e. Exception e => SThrow e
   | SRetry
-  | SStop (n ())
+  | SStop (m ())
 
 --------------------------------------------------------------------------------
 -- * @TVar@s
@@ -86,7 +82,7 @@ data STMAction n r
 -- | A 'TVar' is a tuple of a unique ID and the value contained. The
 -- ID is so that blocked transactions can be re-run when a 'TVar' they
 -- depend on has changed.
-newtype TVar r a = TVar (TVarId, r a)
+newtype TVar m a = TVar (TVarId, C.CRef m a)
 
 --------------------------------------------------------------------------------
 -- * Output
@@ -133,15 +129,17 @@ instance Foldable Result where
 -- * Execution
 
 -- | Run a STM transaction, returning an action to undo its effects.
-doTransaction :: MonadRef r n => M n r a -> IdSource -> n (Result a, n (), IdSource, TTrace)
+doTransaction :: C.MonadConc m
+  => M m a
+  -> IdSource
+  -> m (Result a, m (), IdSource, TTrace)
 doTransaction ma idsource = do
   (c, ref) <- runRefCont SStop (Just . Right) (runCont ma)
   (idsource', undo, readen, written, trace) <- go ref c (pure ()) idsource [] [] []
-  res <- readRef ref
+  res <- C.readCRef ref
 
   case res of
     Just (Right val) -> pure (Success (nub readen) (nub written) val, undo, idsource', reverse trace)
-
     Just (Left  exc) -> undo >> pure (Exception exc,      pure (), idsource, reverse trace)
     Nothing          -> undo >> pure (Retry $ nub readen, pure (), idsource, reverse trace)
 
@@ -159,15 +157,18 @@ doTransaction ma idsource = do
       case tact of
         TStop  -> pure (newIDSource, newUndo, newReaden, newWritten, TStop:newSofar)
         TRetry -> do
-          writeRef ref Nothing
+          C.atomicWriteCRef ref Nothing
           pure (newIDSource, newUndo, newReaden, newWritten, TRetry:newSofar)
         TThrow -> do
-          writeRef ref (Just . Left $ case act of SThrow e -> toException e; _ -> undefined)
+          C.atomicWriteCRef ref (Just . Left $ case act of SThrow e -> toException e; _ -> undefined)
           pure (newIDSource, newUndo, newReaden, newWritten, TThrow:newSofar)
         _ -> go ref newAct newUndo newIDSource newReaden newWritten newSofar
 
 -- | Run a transaction for one step.
-stepTrans :: MonadRef r n => STMAction n r -> IdSource -> n (STMAction n r, n (), IdSource, [TVarId], [TVarId], TAction)
+stepTrans :: forall m. C.MonadConc m
+  => STMAction m
+  -> IdSource
+  -> m (STMAction m, m (), IdSource, [TVarId], [TVarId], TAction)
 stepTrans act idsource = case act of
   SCatch  h stm c -> stepCatch h stm c
   SRead   ref c   -> stepRead ref c
@@ -189,17 +190,17 @@ stepTrans act idsource = case act of
         Nothing   -> pure (SThrow exc, nothing, idsource, [], [], TCatch trace Nothing))
 
     stepRead (TVar (tvid, ref)) c = do
-      val <- readRef ref
+      val <- (C.readCRef :: C.CRef m a -> m a) ref
       pure (c val, nothing, idsource, [tvid], [], TRead tvid)
 
     stepWrite (TVar (tvid, ref)) a c = do
-      old <- readRef ref
-      writeRef ref a
-      pure (c, writeRef ref old, idsource, [], [tvid], TWrite tvid)
+      old <- (C.readCRef :: C.CRef m a -> m a) ref
+      C.atomicWriteCRef ref a
+      pure (c, C.atomicWriteCRef ref old, idsource, [], [tvid], TWrite tvid)
 
     stepNew n a c = do
       let (idsource', tvid) = nextTVId n idsource
-      ref <- newRef a
+      ref <- (C.newCRef :: a -> m (C.CRef m a)) a
       let tvar = TVar (tvid, ref)
       pure (c tvar, nothing, idsource', [], [tvid], TNew tvid)
 

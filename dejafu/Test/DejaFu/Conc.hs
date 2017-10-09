@@ -1,9 +1,5 @@
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeSynonymInstances #-}
 
 -- |
 -- Module      : Test.DejaFu.Conc
@@ -11,7 +7,7 @@
 -- License     : MIT
 -- Maintainer  : Michael Walker <mike@barrucadu.co.uk>
 -- Stability   : experimental
--- Portability : FlexibleInstances, GeneralizedNewtypeDeriving, MultiParamTypeClasses, RankNTypes, TypeFamilies, TypeSynonymInstances
+-- Portability : GeneralizedNewtypeDeriving, TypeFamilies
 --
 -- Deterministic traced execution of concurrent computations.
 --
@@ -19,10 +15,8 @@
 -- out to the supplied scheduler after each step to determine which
 -- thread runs next.
 module Test.DejaFu.Conc
-  ( -- * The @ConcT@ monad transformer
-    ConcT
-  , ConcST
-  , ConcIO
+  ( -- * The @DejaFu@ monad transformer
+    DejaFu
 
   -- * Executing computations
   , Failure(..)
@@ -47,16 +41,10 @@ module Test.DejaFu.Conc
   ) where
 
 import           Control.Exception                (MaskingState(..))
-import qualified Control.Monad.Base               as Ba
 import qualified Control.Monad.Catch              as Ca
 import qualified Control.Monad.IO.Class           as IO
-import           Control.Monad.Ref                (MonadRef)
-import qualified Control.Monad.Ref                as Re
-import           Control.Monad.ST                 (ST)
 import           Control.Monad.Trans.Class        (MonadTrans(..))
 import qualified Data.Foldable                    as F
-import           Data.IORef                       (IORef)
-import           Data.STRef                       (STRef)
 import           Test.DejaFu.Schedule
 
 import qualified Control.Monad.Conc.Class         as C
@@ -65,63 +53,37 @@ import           Test.DejaFu.Conc.Internal
 import           Test.DejaFu.Conc.Internal.Common
 import           Test.DejaFu.STM
 
--- | @since 0.6.0.0
-newtype ConcT r n a = C { unC :: M n r a } deriving (Functor, Applicative, Monad)
+-- | @since unreleased
+newtype DejaFu m a = C { unC :: M m a } deriving (Functor, Applicative, Monad)
 
--- | A 'MonadConc' implementation using @ST@, this should be preferred
--- if you do not need 'liftIO'.
---
--- @since 0.4.0.0
-type ConcST t = ConcT (STRef t) (ST t)
-
--- | A 'MonadConc' implementation using @IO@.
---
--- @since 0.4.0.0
-type ConcIO = ConcT IORef IO
-
-toConc :: ((a -> Action n r) -> Action n r) -> ConcT r n a
+toConc :: ((a -> Action m) -> Action m) -> DejaFu m a
 toConc = C . cont
 
-wrap :: (M n r a -> M n r a) -> ConcT r n a -> ConcT r n a
+wrap :: (M m a -> M m a) -> DejaFu m a -> DejaFu m a
 wrap f = C . f . unC
 
-instance IO.MonadIO ConcIO where
-  liftIO ma = toConc (\c -> ALift (fmap c ma))
+instance IO.MonadIO m => IO.MonadIO (DejaFu m) where
+  liftIO ma = toConc (\c -> ALift (fmap c (IO.liftIO ma)))
 
-instance Ba.MonadBase IO ConcIO where
-  liftBase = IO.liftIO
-
-instance Re.MonadRef (CRef r) (ConcT r n) where
-  newRef a = toConc (ANewCRef "" a)
-
-  readRef ref = toConc (AReadCRef ref)
-
-  writeRef ref a = toConc (\c -> AWriteCRef ref a (c ()))
-
-  modifyRef ref f = toConc (AModCRef ref (\a -> (f a, ())))
-
-instance Re.MonadAtomicRef (CRef r) (ConcT r n) where
-  atomicModifyRef ref f = toConc (AModCRef ref f)
-
-instance MonadTrans (ConcT r) where
+instance MonadTrans DejaFu where
   lift ma = toConc (\c -> ALift (fmap c ma))
 
-instance Ca.MonadCatch (ConcT r n) where
+instance Ca.MonadCatch (DejaFu m) where
   catch ma h = toConc (ACatching (unC . h) (unC ma))
 
-instance Ca.MonadThrow (ConcT r n) where
+instance Ca.MonadThrow (DejaFu m) where
   throwM e = toConc (\_ -> AThrow e)
 
-instance Ca.MonadMask (ConcT r n) where
+instance Ca.MonadMask (DejaFu m) where
   mask                mb = toConc (AMasking MaskedInterruptible   (\f -> unC $ mb $ wrap f))
   uninterruptibleMask mb = toConc (AMasking MaskedUninterruptible (\f -> unC $ mb $ wrap f))
 
-instance Monad n => C.MonadConc (ConcT r n) where
-  type MVar     (ConcT r n) = MVar r
-  type CRef     (ConcT r n) = CRef r
-  type Ticket   (ConcT r n) = Ticket
-  type STM      (ConcT r n) = STMLike n r
-  type ThreadId (ConcT r n) = ThreadId
+instance Monad m => C.MonadConc (DejaFu m) where
+  type MVar     (DejaFu m) = MVar m
+  type CRef     (DejaFu m) = CRef m
+  type Ticket   (DejaFu m) = Ticket
+  type STM      (DejaFu m) = STM m
+  type ThreadId (DejaFu m) = ThreadId
 
   -- ----------
 
@@ -191,13 +153,13 @@ instance Monad n => C.MonadConc (ConcT r n) where
 -- nonexistent thread. In either of those cases, the computation will
 -- be halted.
 --
--- @since 0.8.0.0
-runConcurrent :: MonadRef r n
+-- @since unreleased
+runConcurrent :: C.MonadConc m
   => Scheduler s
   -> MemType
   -> s
-  -> ConcT r n a
-  -> n (Either Failure a, s, Trace)
+  -> DejaFu m a
+  -> m (Either Failure a, s, Trace)
 runConcurrent sched memtype s ma = do
   (res, ctx, trace, _) <- runConcurrency sched memtype s initialIdSource 2 (unC ma)
   pure (res, cSchedState ctx, F.toList trace)
@@ -209,6 +171,6 @@ runConcurrent sched memtype s ma = do
 -- of these conditions will result in the computation failing with
 -- @IllegalSubconcurrency@.
 --
--- @since 0.6.0.0
-subconcurrency :: ConcT r n a -> ConcT r n (Either Failure a)
+-- @since unreleased
+subconcurrency :: DejaFu m a -> DejaFu m (Either Failure a)
 subconcurrency ma = toConc (ASub (unC ma))
