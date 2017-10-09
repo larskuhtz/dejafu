@@ -267,10 +267,12 @@ initialIdSource = Id 0 0 0 0 [] [] [] []
 
 -- | All the actions that a thread can perform.
 --
--- @since 0.9.0.0
+-- @since unreleased
 data ThreadAction =
     Fork ThreadId
   -- ^ Start a new thread.
+  | ForkOS ThreadId
+  -- ^ Start a new bound thread.
   | MyThreadId
   -- ^ Get the 'ThreadId' of the current thread.
   | GetNumCapabilities Int
@@ -359,6 +361,7 @@ data ThreadAction =
 
 instance NFData ThreadAction where
   rnf (Fork t) = rnf t
+  rnf (ForkOS t) = rnf t
   rnf (ThreadDelay n) = rnf n
   rnf (GetNumCapabilities c) = rnf c
   rnf (SetNumCapabilities c) = rnf c
@@ -420,10 +423,12 @@ tvarsOf act = S.fromList $ case act of
 
 -- | A one-step look-ahead at what a thread will do next.
 --
--- @since 0.9.0.0
+-- @since unreleased
 data Lookahead =
     WillFork
   -- ^ Will start a new thread.
+  | WillForkOS
+  -- ^ Will start a new bound thread.
   | WillMyThreadId
   -- ^ Will get the 'ThreadId'.
   | WillGetNumCapabilities
@@ -526,6 +531,7 @@ instance NFData Lookahead where
 -- @since 0.4.0.0
 rewind :: ThreadAction -> Maybe Lookahead
 rewind (Fork _) = Just WillFork
+rewind (ForkOS _) = Just WillForkOS
 rewind MyThreadId = Just WillMyThreadId
 rewind (GetNumCapabilities _) = Just WillGetNumCapabilities
 rewind (SetNumCapabilities i) = Just (WillSetNumCapabilities i)
@@ -570,6 +576,7 @@ rewind StopSubconcurrency = Just WillStopSubconcurrency
 -- @since 0.4.0.0
 willRelease :: Lookahead -> Bool
 willRelease WillFork = True
+willRelease WillForkOS = True
 willRelease WillYield = True
 willRelease (WillThreadDelay _) = True
 willRelease (WillPutMVar _) = True
@@ -799,7 +806,8 @@ showTrace trc = intercalate "\n" $ concatMap go trc : strkey where
 -- @since 0.7.3.0
 threadNames :: Trace -> [(Int, String)]
 threadNames = mapMaybe go where
-  go (_, _, Fork (ThreadId (Just name) i)) = Just (i, name)
+  go (_, _, Fork   (ThreadId (Just name) i)) = Just (i, name)
+  go (_, _, ForkOS (ThreadId (Just name) i)) = Just (i, name)
   go _ = Nothing
 
 -- | Count the number of pre-emptions in a schedule prefix.

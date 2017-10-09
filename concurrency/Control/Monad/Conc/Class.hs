@@ -16,16 +16,16 @@
 -- This module captures in a typeclass the interface of concurrency
 -- monads.
 --
--- __Deviations:__ An instance of @MonadConc@ is not required to be
--- an instance of @MonadFix@, unlike @IO@. The @CRef@, @MVar@, and
+-- __Deviations:__ An instance of @MonadConc@ is not required to be an
+-- instance of @MonadFix@, unlike @IO@. The @CRef@, @MVar@, and
 -- @Ticket@ types are not required to be instances of @Show@ or @Eq@,
 -- unlike their normal counterparts. The @threadCapability@,
 -- @threadWaitRead@, @threadWaitWrite@, @threadWaitReadSTM@,
 -- @threadWaitWriteSTM@, and @mkWeakThreadId@ functions are not
 -- provided. The @threadDelay@ function is not required to delay the
--- thread, merely to yield it. Bound threads are not supported. The
--- @BlockedIndefinitelyOnMVar@ (and similar) exceptions are /not/
--- thrown during testing, so do not rely on them at all.
+-- thread, merely to yield it. The @BlockedIndefinitelyOnMVar@ (and
+-- similar) exceptions are /not/ thrown during testing, so do not rely
+-- on them at all.
 module Control.Monad.Conc.Class
   ( MonadConc(..)
 
@@ -37,14 +37,6 @@ module Control.Monad.Conc.Class
   -- ** Named Threads
   , forkN
   , forkOnN
-
-  -- ** Bound Threads
-
-  -- | @MonadConc@ does not support bound threads, if you need that
-  -- sort of thing you will have to use regular @IO@.
-
-  , rtsSupportsBoundThreads
-  , isCurrentThreadBound
 
   -- * Exceptions
   , throw
@@ -102,7 +94,7 @@ import qualified Control.Monad.Writer.Strict  as WS
 -- Every @MonadConc@ has an associated 'MonadSTM', transactions of
 -- which can be run atomically.
 --
--- @since 1.0.0.0
+-- @since unreleased
 class ( Applicative m, Monad m
       , MonadCatch m, MonadThrow m, MonadMask m
       , MonadSTM (STM m)
@@ -111,6 +103,7 @@ class ( Applicative m, Monad m
   {-# MINIMAL
         (forkWithUnmask | forkWithUnmaskN)
       , (forkOnWithUnmask | forkOnWithUnmaskN)
+      , (forkOS | forkOSN)
       , getNumCapabilities
       , setNumCapabilities
       , myThreadId
@@ -187,10 +180,6 @@ class ( Applicative m, Monad m
   -- | Like 'forkWithUnmask', but the thread is given a name which may
   -- be used to present more useful debugging information.
   --
-  -- If an empty name is given, the @ThreadId@ is used. If names
-  -- conflict, successive threads with the same name are given a
-  -- numeric suffix, counting up from 1.
-  --
   -- > forkWithUnmaskN _ = forkWithUnmask
   --
   -- @since 1.0.0.0
@@ -226,6 +215,25 @@ class ( Applicative m, Monad m
   -- @since 1.0.0.0
   forkOnWithUnmaskN :: String -> Int -> ((forall a. m a -> m a) -> m ()) -> m (ThreadId m)
   forkOnWithUnmaskN _ = forkOnWithUnmask
+
+  -- | Fork a computation to happen in a /bound thread/, which is
+  -- necessary if you need to call foreign (non-Haskell) libraries
+  -- that make use of thread-local state, such as OpenGL.
+  --
+  -- > forkOS = forkOSN ""
+  --
+  -- @since unreleased
+  forkOS :: m () -> m (ThreadId m)
+  forkOS = forkOSN ""
+
+  -- | Like 'forkOS', but the thread is given a name which may be used
+  -- to present more useful debugging information.
+  --
+  -- > forkOSN _ = forkOS
+  --
+  -- @since undefined
+  forkOSN :: String -> m () -> m (ThreadId m)
+  forkOSN _ = forkOS
 
   -- | Get the number of Haskell threads that can run simultaneously.
   --
@@ -271,10 +279,6 @@ class ( Applicative m, Monad m
 
   -- | Create a new empty @MVar@, but it is given a name which may be
   -- used to present more useful debugging information.
-  --
-  -- If an empty name is given, a counter starting from 0 is used. If
-  -- names conflict, successive @MVar@s with the same name are given a
-  -- numeric suffix, counting up from 1.
   --
   -- > newEmptyMVarN _ = newEmptyMVar
   --
@@ -335,10 +339,6 @@ class ( Applicative m, Monad m
 
   -- | Create a new reference, but it is given a name which may be
   -- used to present more useful debugging information.
-  --
-  -- If an empty name is given, a counter starting from 0 is used. If
-  -- names conflict, successive @CRef@s with the same name are given a
-  -- numeric suffix, counting up from 1.
   --
   -- > newCRefN _ = newCRef
   --
@@ -472,10 +472,6 @@ killThread tid = throwTo tid ThreadKilled
 -- | Like 'fork', but the thread is given a name which may be used to
 -- present more useful debugging information.
 --
--- If no name is given, the @ThreadId@ is used. If names conflict,
--- successive threads with the same name are given a numeric suffix,
--- counting up from 1.
---
 -- @since 1.0.0.0
 forkN :: MonadConc m => String -> m () -> m (ThreadId m)
 forkN name ma = forkWithUnmaskN name (const ma)
@@ -483,27 +479,9 @@ forkN name ma = forkWithUnmaskN name (const ma)
 -- | Like 'forkOn', but the thread is given a name which may be used
 -- to present more useful debugging information.
 --
--- If no name is given, the @ThreadId@ is used. If names conflict,
--- successive threads with the same name are given a numeric suffix,
--- counting up from 1.
---
 -- @since 1.0.0.0
 forkOnN :: MonadConc m => String -> Int -> m () -> m (ThreadId m)
 forkOnN name i ma = forkOnWithUnmaskN name i (const ma)
-
--- Bound Threads
-
--- | Provided for compatibility, always returns 'False'.
---
--- @since 1.0.0.0
-rtsSupportsBoundThreads :: Bool
-rtsSupportsBoundThreads = False
-
--- | Provided for compatibility, always returns 'False'.
---
--- @since 1.0.0.0
-isCurrentThreadBound :: MonadConc m => m Bool
-isCurrentThreadBound = pure False
 
 -- Exceptions
 
@@ -568,10 +546,6 @@ newMVar a = do
 -- | Create a new @MVar@ containing a value, but it is given a name
 -- which may be used to present more useful debugging information.
 --
--- If no name is given, a counter starting from 0 is used. If names
--- conflict, successive @MVar@s with the same name are given a numeric
--- suffix, counting up from 1.
---
 -- @since 1.0.0.0
 newMVarN :: MonadConc m => String -> a -> m (MVar m a)
 newMVarN n a = do
@@ -613,6 +587,7 @@ instance MonadConc IO where
 
   fork   = IO.forkIO
   forkOn = IO.forkOn
+  forkOS = IO.forkOS
 
   forkWithUnmaskN n ma = forkWithUnmask $ \umask -> do
     labelMe n
@@ -667,6 +642,9 @@ instance C => MonadConc (T m) where                            { \
                                                                  \
   fork   = liftedF F fork                                      ; \
   forkOn = liftedF F . forkOn                                  ; \
+  forkOS = liftedF F forkOS                                    ; \
+                                                                 \
+  forkOSN = liftedF F . forkOSN                                ; \
                                                                  \
   forkWithUnmask        = liftedFork F forkWithUnmask          ; \
   forkWithUnmaskN   n   = liftedFork F (forkWithUnmaskN   n  ) ; \

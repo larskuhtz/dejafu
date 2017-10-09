@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
 
 -- |
@@ -7,7 +8,7 @@
 -- License     : MIT
 -- Maintainer  : Michael Walker <mike@barrucadu.co.uk>
 -- Stability   : experimental
--- Portability : GeneralizedNewtypeDeriving, TypeFamilies
+-- Portability : GeneralizedNewtypeDeriving, TypeFamilies, RankNTypes
 --
 -- Deterministic traced execution of concurrent computations.
 --
@@ -87,8 +88,9 @@ instance Monad m => C.MonadConc (DejaFu m) where
 
   -- ----------
 
-  forkWithUnmaskN   n ma = toConc (AFork n (\umask -> runCont (unC $ ma $ wrap umask) (\_ -> AStop (pure ()))))
+  forkWithUnmaskN   n ma = toConc (AFork   n (\umask -> runCont (unC $ ma $ wrap umask) (\_ -> AStop (pure ()))))
   forkOnWithUnmaskN n _  = C.forkWithUnmaskN n
+  forkOSN n ma = forkOSWithUnmaskN n (const ma)
 
   -- This implementation lies and returns 2 until a value is set. This
   -- will potentially avoid special-case behaviour for 1 capability,
@@ -135,6 +137,10 @@ instance Monad m => C.MonadConc (DejaFu m) where
   -- ----------
 
   atomically = toConc . AAtom
+
+-- move this into the instance defn when forkOSWithUnmaskN is added to MonadConc in 2018
+forkOSWithUnmaskN :: Applicative m => String -> ((forall a. DejaFu m a -> DejaFu m a) -> DejaFu m ()) -> DejaFu m ThreadId
+forkOSWithUnmaskN n ma = toConc (AForkOS n (\umask -> runCont (unC $ ma $ wrap umask) (\_ -> AStop (pure ()))))
 
 -- | Run a concurrent computation with a given 'Scheduler' and initial
 -- state, returning a failure reason on error. Also returned is the

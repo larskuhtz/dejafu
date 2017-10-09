@@ -58,6 +58,8 @@ runConcurrency sched memtype g idsrc caps ma = do
                     , cCaps       = caps
                     }
   (finalCtx, trace, finalAction) <- runThreads sched memtype ref ctx
+  let finalThreads = cThreads finalCtx
+  mapM_ (`kill` finalThreads) (M.keys finalThreads)
   out <- C.readCRef ref
   pure (fromJust out, finalCtx, trace, finalAction)
 
@@ -170,9 +172,16 @@ stepThread :: C.MonadConc m
 stepThread sched memtype tid action ctx = case action of
     -- start a new thread, assigning it the next 'ThreadId'
     AFork n a b -> pure $
-        let threads' = launch tid newtid a (cThreads ctx)
-            (idSource', newtid) = nextTId n (cIdSource ctx)
-        in (Right ctx { cThreads = goto (b newtid) tid threads', cIdSource = idSource' }, Single (Fork newtid))
+      let threads' = launch tid newtid a (cThreads ctx)
+          (idSource', newtid) = nextTId n (cIdSource ctx)
+      in (Right ctx { cThreads = goto (b newtid) tid threads', cIdSource = idSource' }, Single (Fork newtid))
+
+    -- start a new bound thread, assigning it the next 'ThreadId'
+    AForkOS n a b -> do
+      let (idSource', newtid) = nextTId n (cIdSource ctx)
+      let threads' = launch tid newtid a (cThreads ctx)
+      threads'' <- makeBound newtid threads'
+      pure (Right ctx { cThreads = goto (b newtid) tid threads'', cIdSource = idSource' }, Single (Fork newtid))
 
     -- get the 'ThreadId' of the current thread
     AMyTId c -> simple (goto (c tid) tid (cThreads ctx)) MyThreadId
@@ -312,7 +321,7 @@ stepThread sched memtype tid action ctx = case action of
     -- lift an action from the underlying monad into the @Conc@
     -- computation.
     ALift na -> do
-      a <- na
+      a <- runLiftedAct tid (cThreads ctx) na
       simple (goto a tid (cThreads ctx)) LiftIO
 
     -- throw an exception, and propagate it to the appropriate
@@ -363,7 +372,10 @@ stepThread sched memtype tid action ctx = case action of
     AReturn c -> simple (goto c tid (cThreads ctx)) Return
 
     -- kill the current thread.
-    AStop na -> na >> simple (kill tid (cThreads ctx)) Stop
+    AStop na -> do
+      na
+      threads' <- kill tid (cThreads ctx)
+      simple threads' Stop
 
     -- run a subconcurrent computation.
     ASub ma c
@@ -390,7 +402,9 @@ stepThread sched memtype tid action ctx = case action of
            Just ts' -> simple ts' act
            Nothing
              | t == initialThread -> pure (Left (UncaughtException some), Single act)
-             | otherwise -> simple (kill t ts) act
+             | otherwise -> do
+                 ts' <- kill t ts
+                 simple ts' act
 
     -- helper for actions which only change the threads.
     simple threads' act = pure (Right ctx { cThreads = threads' }, Single act)
